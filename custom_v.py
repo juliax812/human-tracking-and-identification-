@@ -1,0 +1,249 @@
+import argparse
+import os
+import sys
+import os.path as osp
+import time
+import cv2
+import torch
+### PTC implementation, trt => drive ~ trt_utils
+
+from loguru import logger
+
+# root_path=os.path.dirname(os.path.abspath(os.path.dirname(__file__))) 
+# sys.path.append(root_path)  
+
+from yolox.data.data_augment import preproc
+from yolox.exp import get_exp
+from yolox.utils import fuse_model, get_model_info, postprocess
+from yolox.utils.visualize import plot_tracking
+from yolox.tracker.byte_tracker import BYTETracker
+from yolox.tracking_utils.timer import Timer
+
+import glob
+
+IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
+
+class Trk_vars(object):
+    def __init__(self):
+        self.track_thresh = 0.5
+        self.track_buffer = 30
+        self.match_thresh = 0.8
+        self.aspect_ratio_thresh = 1.6
+        self.min_box_area = 10.0
+        self.mot20 = False
+        self.fp16 = True
+        # inf vars
+        self.exp_file = "exps/example/mot/yolox_nano_mix_det.py"
+        self.ckpt_file = "pretrained/bytetrack_nano_mot17.pth.tar"
+        self.source = "videos/mot16-04.mp4"
+        self.save_result = True
+        self.save_txt = True
+        self.save_video = False
+        self.output_dir = "A_results"
+        self.videos_f = "videos"
+        self.device = "gpu"
+        self.demo = "video"
+
+        self.dataset = None
+        self.w = None
+        self.h = None
+        self.video_name = None
+        self.txt_name = None
+
+
+def make_parser():
+    parser = argparse.ArgumentParser("ByteTrack Demo!")
+    parser.add_argument("-dataset", type=str, default=None, help="dataset label")
+    return parser
+
+
+
+def write_results(filename, results):
+    save_format = '{frame},{id},{x1},{y1},{w},{h},{s},-1,-1,-1\n'
+    with open(filename, 'w') as f:
+        for frame_id, tlwhs, track_ids, scores in results:
+            for tlwh, track_id, score in zip(tlwhs, track_ids, scores):
+                if track_id < 0:
+                    continue
+                x1, y1, w, h = tlwh
+                line = save_format.format(frame=frame_id, id=track_id, x1=round(x1, 1), y1=round(y1, 1), w=round(w, 1), h=round(h, 1), s=round(score, 2))
+                f.write(line)
+    logger.info('save results to {}'.format(filename))
+
+
+class Predictor(object):
+    def __init__(
+        self,
+        model,
+        exp,
+        device=torch.device("cpu"),
+        fp16=False
+    ):
+        self.model = model
+        self.num_classes = exp.num_classes
+        self.confthre = exp.test_conf
+        self.nmsthre = exp.nmsthre
+        self.test_size = exp.test_size
+        self.device = device
+        self.fp16 = fp16
+        self.rgb_means = (0.485, 0.456, 0.406)
+        self.std = (0.229, 0.224, 0.225)
+
+    def inference(self, img, timer):
+        img_info = {"id": 0}
+        if isinstance(img, str):
+            img_info["file_name"] = osp.basename(img)
+            img = cv2.imread(img)
+        else:
+            img_info["file_name"] = None
+
+        height, width = img.shape[:2]
+        img_info["height"] = height
+        img_info["width"] = width
+        img_info["raw_img"] = img
+
+        img, ratio = preproc(img, self.test_size, self.rgb_means, self.std)
+        img_info["ratio"] = ratio
+        img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
+        if self.fp16:
+            img = img.half()  # to FP16
+
+        with torch.no_grad():
+            timer.tic()
+            outputs = self.model(img)
+            outputs = postprocess(
+                outputs, self.num_classes, self.confthre, self.nmsthre
+            )
+            #logger.info("Infer time: {:.4f}s".format(time.time() - t0))
+        return outputs, img_info
+
+
+def imageflow_demo(predictor, vis_folder, current_time, args):
+
+    # total_pc = 0
+
+    cap = cv2.VideoCapture(args.dataset)
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))  # float
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))  # float
+    fps = 30
+
+    logger.info(f"video save_path is {args.video_name}")
+    vid_writer = None
+    if args.save_video:
+        vid_writer = cv2.VideoWriter(
+            args.video_name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
+        )
+
+    tracker = BYTETracker(args, frame_rate=30)
+    timer = Timer()
+    frame_id = 0
+    results = []
+    while(cap.isOpened()):
+        ret, frame = cap.read()
+        if ret==True:
+            if frame_id % 20 == 0:
+                logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
+
+            outputs, img_info = predictor.inference(frame, timer)
+            if outputs[0] is not None:
+                online_targets = tracker.update(outputs[0], [img_info['height'], img_info['width']], exp.test_size)
+                # total_pc += p_c_total
+                # print("Total pedestrains seen: ", total_pc)
+                online_tlwhs = []
+                online_ids = []
+                online_scores = []
+                for t in online_targets:
+                    tlwh = t.tlwh
+                    tid = t.track_id
+                    vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
+                    if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
+                        online_tlwhs.append(tlwh)
+                        online_ids.append(tid)
+                        online_scores.append(t.score)
+                        results.append(
+                            f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
+                        )
+                timer.toc()
+                online_im = plot_tracking(
+                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
+                )
+            else:
+                timer.toc()
+                online_im = img_info['raw_img']
+            if args.save_video:
+                vid_writer.write(online_im)
+
+            frame_id += 1
+        else:
+            break
+
+    if args.save_txt:
+        with open(args.txt_name, 'w') as f:
+            f.writelines(results)
+        logger.info(f"save results to {args.txt_name}")
+
+    cap.release()
+    
+
+
+def main(exp, args, new_exp, new_ckpt):
+
+    vars_trk = Trk_vars()
+    vars_trk.dataset = "/content/drive/MyDrive/dataset/pedestrian_custom/" + args.dataset + ".mp4"
+    vars_trk.exp_file, vars_trk.ckpt_file = new_exp, new_ckpt
+
+    # YOLOX/nano/
+    output_dir = vars_trk.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    if vars_trk.save_result:
+        # track_vis/
+        vis_folder = osp.join(output_dir, "videos")
+        os.makedirs(vis_folder, exist_ok=True)
+    
+    vars_trk.video_name = osp.join(vis_folder, args.dataset+"_"+vars_trk.ckpt_file.rsplit("_")[1]+".mp4")
+    vars_trk.txt_name = osp.join(output_dir, args.dataset+"_"+vars_trk.ckpt_file.rsplit("_")[1]+".txt")
+
+    device = torch.device("cuda" if vars_trk.device == "gpu" else "cpu")
+
+    logger.info("Args: {}".format(vars_trk))
+
+    model = exp.get_model().to(device)
+    logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
+    model.eval()
+
+    logger.info("loading checkpoint")
+    ckpt = torch.load(vars_trk.ckpt_file, map_location="cpu")
+    # load the model state dict
+    model.load_state_dict(ckpt["model"])
+    logger.info("loaded checkpoint done.")
+
+    # fuse + half precision
+    model = fuse_model(model)
+    model = model.half()  # to FP16
+
+    predictor = Predictor(model, exp, device, vars_trk.fp16)
+    current_time = time.localtime()
+
+    imageflow_demo(predictor, output_dir, current_time, vars_trk)
+
+
+if __name__ == "__main__":
+
+    exp_py = ["exps/example/mot/yolox_nano_mix_det.py",\
+              "exps/example/mot/yolox_tiny_mix_det.py",\
+              "exps/example/mot/yolox_s_mix_det.py"]
+
+    ckpt_pt = ["pretrained/bytetrack_nano_mot17.pth.tar",\
+              "pretrained/bytetrack_tiny_mot17.pth.tar",\
+              "pretrained/bytetrack_s_mot17.pth.tar"]
+
+    args = make_parser().parse_args()
+
+    for idx,cur_exp in enumerate(exp_py):
+        exp = get_exp(cur_exp, None) # args.exp_file
+        main(exp, args, cur_exp, ckpt_pt[idx])
+        
+        
+
